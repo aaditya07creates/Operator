@@ -1,0 +1,59 @@
+# Environment & secrets
+.env
+*.env
+!.env.example
+
+# Virtual environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+dist/
+*.egg-info/
+*.egg
+MANIFEST
+
+# Logs
+*.log
+logs/
+
+# OPERATOR runtime data
+operator_learnings.json
+operator_learnings*.json
+operatorone/operator_learnings.json
+_env_check.txt
+
+# Claude Code internal files
+claude-*-cwd
+.claude/
+CLAUDE.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temp
+*.tmp
+*.temp
+temp/
+tmp/
