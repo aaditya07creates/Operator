@@ -1,0 +1,26 @@
+# OPERATOR — AI Terminal Assistant
+# pip install -r requirements.txt
+
+# Core
+psutil>=5.9.0
+colorama>=0.4.6
+
+# AI Providers
+mistralai>=1.0.0
+google-generativeai>=0.3.0
+
+# System control
+pynput>=1.7.6
+pygetwindow>=0.0.9
+pywin32>=305
+pyperclip>=1.8.2
+
+# Screenshot + vision
+mss>=9.0.1
+Pillow>=10.0.0
+
+# Web search
+ddgs>=9.10.0
+
+# Environment variable loading from .env file
+python-dotenv>=1.0.0
