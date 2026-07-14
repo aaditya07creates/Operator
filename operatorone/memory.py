@@ -1,20 +1,8 @@
 from typing import List, Dict, Optional
-from dataclasses import dataclass
 from datetime import datetime
 
 from learning_system import LearningSystem
-from utils import categorize_error
-
-
-@dataclass
-class CommandFix:
-    """Represents a successful command fix"""
-    original_command: str
-    fixed_command: str
-    error_type: str
-    context: str
-    timestamp: str
-    use_count: int = 1
+import memory_utils
 
 
 class MemoryManager:
@@ -30,37 +18,15 @@ class MemoryManager:
 
     def __init__(self):
         self.learning_system = LearningSystem()
-        self._fact_counter = 0
-        self._rule_counter = 0
-        self._rel_counter = 0
-        self._ltm_counter = 0
-        self._init_counters()
 
-    def _init_counters(self):
-        """Initialize counters from existing data to prevent ID collisions."""
+    def _next_fact_id(self) -> str:
+        """Allocate the next fact id from current data (safe against curator adds)."""
         facts = self.learning_system.learnings["knowledge_base"]["facts"]
-        max_fact = 0
-        for f in facts:
-            fid = f.get("id", "")
-            if fid.startswith("fact_"):
-                try:
-                    num = int(fid.split("_")[1])
-                    max_fact = max(max_fact, num)
-                except (ValueError, IndexError):
-                    pass
-        self._fact_counter = max_fact
+        return f"fact_{memory_utils.max_id_number(facts, 'fact') + 1:03d}"
 
-        ltm = self.learning_system.learnings.get("conversation_memory", {}).get("long_term_memory", [])
-        max_ltm = 0
-        for m in ltm:
-            mid = m.get("id", "")
-            if mid.startswith("ltm_"):
-                try:
-                    num = int(mid.split("_")[1])
-                    max_ltm = max(max_ltm, num)
-                except (ValueError, IndexError):
-                    pass
-        self._ltm_counter = max_ltm
+    def _next_ltm_id(self) -> str:
+        ltm = self.learning_system.learnings["conversation_memory"]["long_term_memory"]
+        return f"ltm_{memory_utils.max_id_number(ltm, 'ltm') + 1:03d}"
 
     # ==================== App Memory ====================
 
@@ -99,33 +65,6 @@ class MemoryManager:
             error=error
         )
 
-    def find_similar_fixes(
-        self,
-        command: str,
-        error: str
-    ) -> List[CommandFix]:
-        """
-        Find fixes for similar errors.
-
-        Returns:
-            List of CommandFix objects, most relevant first
-        """
-        raw_fixes = self.learning_system.get_relevant_fixes(error)
-
-        # Convert to CommandFix objects
-        fixes = []
-        for fix_dict in raw_fixes:
-            fixes.append(CommandFix(
-                original_command=fix_dict.get('original', ''),
-                fixed_command=fix_dict.get('fix', ''),
-                error_type=categorize_error(error),
-                context="",
-                timestamp=datetime.now().isoformat(),
-                use_count=fix_dict.get('count', 1)
-            ))
-
-        return fixes
-
     # ==================== Pattern Memory ====================
 
     def remember_pattern(self, pattern_id: str, description: str):
@@ -146,18 +85,6 @@ class MemoryManager:
         """Get a remembered task"""
         return self.learning_system.get_task(task_name)
 
-    # ==================== Success Patterns ====================
-
-    def record_successful_pattern(self, intent: str, commands: List[str]):
-        """
-        Record a successful command pattern for future reference.
-
-        This is useful for learning common workflows.
-        """
-        # For now, just update stats
-        # In future, could analyze patterns and create tasks automatically
-        pass
-
     # ==================== Statistics ====================
 
     def update_stats(self, success: bool):
@@ -166,19 +93,21 @@ class MemoryManager:
 
     def get_statistics(self) -> Dict:
         """Get execution statistics"""
-        meta = self.learning_system.learnings["metadata"]
+        with self.learning_system.lock:
+            meta = self.learning_system.learnings["metadata"]
+            command_memory = self.learning_system.learnings.get('command_memory', {})
 
-        return {
-            'total_executed': meta.get('total_commands', 0),
-            'success_rate': meta.get('success_rate', 0.0),
-            'patterns_learned': len(self.learning_system.learnings.get('patterns', {})),
-            'fixes_recorded': sum(
-                len(fixes)
-                for fixes in self.learning_system.learnings.get('fix_patterns', {}).values()
-            ),
-            'apps_known': len(self.learning_system.learnings.get('apps', {})),
-            'tasks_learned': len(self.learning_system.learnings.get('tasks', {}))
-        }
+            return {
+                'total_executed': meta.get('total_commands', 0),
+                'success_rate': meta.get('success_rate', 0.0),
+                'patterns_learned': len(command_memory.get('patterns', {})),
+                'fixes_recorded': sum(
+                    len(fixes)
+                    for fixes in command_memory.get('fix_patterns', {}).values()
+                ),
+                'apps_known': len(command_memory.get('apps', {})),
+                'tasks_learned': len(command_memory.get('tasks', {}))
+            }
 
     def get_memory_summary(self) -> str:
         """Get human-readable memory summary"""
@@ -243,11 +172,12 @@ class MemoryManager:
         Returns:
             Fact ID (existing ID if deduplicated)
         """
-        # Deduplication: check if a fact with same content already exists
-        content_lower = content.lower().strip()
-        for existing in self.learning_system.learnings["knowledge_base"]["facts"]:
-            if existing.get("content", "").lower().strip() == content_lower:
-                # Update existing fact instead of creating duplicate
+        with self.learning_system.lock:
+            facts = self.learning_system.learnings["knowledge_base"]["facts"]
+
+            # Deduplication: update the existing fact instead of creating a copy
+            existing = memory_utils.find_duplicate(content, facts)
+            if existing is not None:
                 existing["confidence"] = max(existing.get("confidence", 0), confidence)
                 existing["access_count"] = existing.get("access_count", 0) + 1
                 existing["last_accessed"] = datetime.now().isoformat()
@@ -257,31 +187,30 @@ class MemoryManager:
                         if t not in existing_tags:
                             existing_tags.append(t)
                     existing["tags"] = existing_tags
-                self.learning_system._save_learnings()
+                self.learning_system.mark_dirty()
                 return existing.get("id", "fact_000")
 
-        self._fact_counter += 1
-        fact_id = f"fact_{self._fact_counter:03d}"
+            fact_id = self._next_fact_id()
 
-        fact = {
-            "id": fact_id,
-            "category": category,
-            "content": content,
-            "confidence": max(0.0, min(1.0, confidence)),
-            "source": source,
-            "tier": tier,
-            "tags": tags or [],
-            "curation_notes": "",
-            "learned_at": datetime.now().isoformat(),
-            "last_accessed": datetime.now().isoformat(),
-            "access_count": 0
-        }
+            fact = {
+                "id": fact_id,
+                "category": category,
+                "content": content,
+                "confidence": max(0.0, min(1.0, confidence)),
+                "source": source,
+                "tier": tier if tier in (1, 2, 3, 4) else 2,
+                "tags": tags or [],
+                "curation_notes": "",
+                "learned_at": datetime.now().isoformat(),
+                "last_accessed": datetime.now().isoformat(),
+                "access_count": 0
+            }
 
-        self.learning_system.learnings["knowledge_base"]["facts"].append(fact)
-        self.learning_system.learnings["metadata"]["total_facts"] += 1
-        self.learning_system._save_learnings()
+            facts.append(fact)
+            self.learning_system.learnings["metadata"]["total_facts"] = len(facts)
+            self.learning_system.mark_dirty()
 
-        return fact_id
+            return fact_id
 
     def get_facts(
         self,
@@ -298,7 +227,8 @@ class MemoryManager:
         Returns:
             List of fact dictionaries
         """
-        facts = self.learning_system.learnings["knowledge_base"]["facts"]
+        with self.learning_system.lock:
+            facts = list(self.learning_system.learnings["knowledge_base"]["facts"])
 
         if category:
             facts = [f for f in facts if f.get("category") == category]
@@ -310,7 +240,8 @@ class MemoryManager:
 
     def get_facts_by_tier(self, tier: int) -> List[Dict]:
         """Get all facts at a specific tier level."""
-        facts = self.learning_system.learnings["knowledge_base"]["facts"]
+        with self.learning_system.lock:
+            facts = list(self.learning_system.learnings["knowledge_base"]["facts"])
         return [f for f in facts if f.get("tier", 2) == tier]
 
     def get_active_facts(self) -> List[Dict]:
@@ -319,35 +250,38 @@ class MemoryManager:
 
     def update_fact_access(self, fact_id: str):
         """Update access count and timestamp for a fact"""
-        for fact in self.learning_system.learnings["knowledge_base"]["facts"]:
-            if fact.get("id") == fact_id:
-                fact["last_accessed"] = datetime.now().isoformat()
-                fact["access_count"] = fact.get("access_count", 0) + 1
-                self.learning_system._save_learnings()
-                break
+        with self.learning_system.lock:
+            for fact in self.learning_system.learnings["knowledge_base"]["facts"]:
+                if fact.get("id") == fact_id:
+                    fact["last_accessed"] = datetime.now().isoformat()
+                    fact["access_count"] = fact.get("access_count", 0) + 1
+                    self.learning_system.mark_dirty()
+                    break
 
     def update_fact(self, fact_id: str, updates: dict) -> bool:
         """Update a fact's fields in-place."""
         ALLOWED = {'content', 'category', 'confidence', 'tier', 'tags', 'curation_notes'}
-        for fact in self.learning_system.learnings["knowledge_base"]["facts"]:
-            if fact.get("id") == fact_id:
-                for key, val in updates.items():
-                    if key in ALLOWED:
-                        fact[key] = val
-                fact["last_accessed"] = datetime.now().isoformat()
-                self.learning_system._save_learnings()
-                return True
+        with self.learning_system.lock:
+            for fact in self.learning_system.learnings["knowledge_base"]["facts"]:
+                if fact.get("id") == fact_id:
+                    for key, val in updates.items():
+                        if key in ALLOWED:
+                            fact[key] = val
+                    fact["last_accessed"] = datetime.now().isoformat()
+                    self.learning_system.mark_dirty()
+                    return True
         return False
 
     def forget_fact(self, fact_id: str) -> bool:
         """Remove a fact from knowledge base"""
-        facts = self.learning_system.learnings["knowledge_base"]["facts"]
-        for i, fact in enumerate(facts):
-            if fact.get("id") == fact_id:
-                facts.pop(i)
-                self.learning_system.learnings["metadata"]["total_facts"] -= 1
-                self.learning_system._save_learnings()
-                return True
+        with self.learning_system.lock:
+            facts = self.learning_system.learnings["knowledge_base"]["facts"]
+            for i, fact in enumerate(facts):
+                if fact.get("id") == fact_id:
+                    facts.pop(i)
+                    self.learning_system.learnings["metadata"]["total_facts"] = len(facts)
+                    self.learning_system.mark_dirty()
+                    return True
         return False
 
     # ==================== User Profile (v3.0) ====================
@@ -389,12 +323,12 @@ class MemoryManager:
             # Generic key
             profile[key] = value
 
-        self.learning_system._save_learnings()
+        self.learning_system.mark_dirty()
 
     def add_preference(self, key: str, value: str):
         """Add a user preference"""
         self.learning_system.learnings["user_profile"]["preferences"][key] = value
-        self.learning_system._save_learnings()
+        self.learning_system.mark_dirty()
 
     def get_preference(self, key: str, default: any = None) -> any:
         """Get a user preference"""
@@ -423,7 +357,7 @@ class MemoryManager:
             context["active_apps"] = active_apps
 
         context["last_interaction"] = datetime.now().isoformat()
-        self.learning_system._save_learnings()
+        self.learning_system.mark_dirty()
 
     def add_long_term_memory(
         self,
@@ -442,21 +376,21 @@ class MemoryManager:
         Returns:
             Memory ID
         """
-        self._ltm_counter += 1
-        ltm_id = f"ltm_{self._ltm_counter:03d}"
+        with self.learning_system.lock:
+            ltm_id = self._next_ltm_id()
 
-        memory = {
-            "id": ltm_id,
-            "type": memory_type,
-            "summary": summary,
-            "date": datetime.now().isoformat(),
-            "significance": significance
-        }
+            memory = {
+                "id": ltm_id,
+                "type": memory_type,
+                "summary": summary,
+                "date": datetime.now().isoformat(),
+                "significance": significance
+            }
 
-        self.learning_system.learnings["conversation_memory"]["long_term_memory"].append(memory)
-        self.learning_system._save_learnings()
+            self.learning_system.learnings["conversation_memory"]["long_term_memory"].append(memory)
+            self.learning_system.mark_dirty()
 
-        return ltm_id
+            return ltm_id
 
     def get_long_term_memories(
         self,

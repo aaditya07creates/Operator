@@ -8,7 +8,7 @@ class FileOps:
     """Handle file creation and execution operations"""
 
     # Default directory for file creation
-    DEFAULT_OUTPUT_DIR = Path("C:/Users/aadit/OperatorPrograms")
+    DEFAULT_OUTPUT_DIR = Path.home() / "OperatorPrograms"
 
     @classmethod
     def _ensure_default_dir(cls):
@@ -68,6 +68,47 @@ class FileOps:
 
         except Exception as e:
             return False, "", f"Failed to create file: {str(e)}"
+
+    @classmethod
+    def read_file(cls, filepath: str, max_chars: int = 100_000) -> Tuple[bool, str, str]:
+        """
+        Read a text file's contents.
+
+        Args:
+            filepath: "notes.txt" (resolves into OperatorPrograms) or an
+                      absolute path like "C:/Users/me/report.md"
+            max_chars: cap on returned characters (avoids flooding the model)
+
+        Returns:
+            (success, output, error) tuple. Output is prefixed with a one-line
+            header (path + size). Binary/undecodable files fail gracefully.
+        """
+        try:
+            path = cls._resolve_path(filepath)
+
+            if not path.exists():
+                return False, "", f"File not found: {path}"
+            if path.is_dir():
+                return False, "", f"Path is a directory, not a file: {path}"
+
+            size = path.stat().st_size
+            try:
+                text = path.read_text(encoding='utf-8', errors='strict')
+            except (UnicodeDecodeError, ValueError):
+                return False, "", f"Not a UTF-8 text file (binary?): {path.name}"
+
+            truncated = len(text) > max_chars
+            if truncated:
+                text = text[:max_chars]
+
+            header = f"# {path.absolute()} ({size} bytes)\n"
+            output = header + text
+            if truncated:
+                output += f"\n... (truncated at {max_chars} chars)"
+            return True, output, ""
+
+        except Exception as e:
+            return False, "", f"Failed to read file: {str(e)}"
 
     @classmethod
     def run_file(cls, filepath: str, wait: bool = False) -> Tuple[bool, str, str]:

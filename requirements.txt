@@ -3,13 +3,16 @@
 
 # Core
 psutil>=5.9.0
-colorama>=0.4.6
+
+# CLI experience
+rich>=13.0.0
+prompt_toolkit>=3.0.0
 
 # AI Providers
 mistralai>=1.0.0
-google-generativeai>=0.3.0
+google-generativeai>=0.8.0
 
-# System control
+# System control (pynput also powers the global-hotkey overlay)
 pynput>=1.7.6
 pygetwindow>=0.0.9
 pywin32>=305
@@ -21,6 +24,9 @@ Pillow>=10.0.0
 
 # Web search
 ddgs>=9.10.0
+
+# Browser bridge (localhost WebSocket server for the Chrome extension)
+websockets>=12.0
 
 # Environment variable loading from .env file
 python-dotenv>=1.0.0

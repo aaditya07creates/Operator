@@ -1,0 +1,11 @@
+# OPERATOR — optional voice input (local, offline speech-to-text)
+# pip install -r requirements-voice.txt
+#
+# faster-whisper runs Whisper on CPU via CTranslate2 (no torch). The model
+# (~150 MB for "base") downloads automatically on first use. Set the size with
+# OPERATOR_WHISPER_MODEL=tiny|base|small|medium and the push-to-talk key with
+# OPERATOR_VOICE_HOTKEY (default <ctrl>+<alt>+v).
+
+faster-whisper>=1.0
+sounddevice>=0.4
+numpy>=1.24

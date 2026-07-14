@@ -44,26 +44,29 @@ class DataManager:
             'ltm_pruned': 0
         }
 
-        # 1. Prune low-confidence old facts
-        stats['facts_pruned'] = self._prune_low_confidence_facts()
+        with self.learning_system.lock:
+            # 1. Prune low-confidence old facts
+            stats['facts_pruned'] = self._prune_low_confidence_facts()
 
-        # 2. Merge similar facts
-        stats['facts_merged'] = self._merge_similar_facts()
+            # 2. Merge similar facts
+            stats['facts_merged'] = self._merge_similar_facts()
 
-        # 3. Auto-demote stale Tier 2 facts to Tier 4
-        stats['facts_demoted'] = self._auto_demote_stale_facts()
+            # 3. Auto-demote stale Tier 2 facts to Tier 4
+            stats['facts_demoted'] = self._auto_demote_stale_facts()
 
-        # 4. Prune archive if too large
-        stats['archive_pruned'] = self._prune_archive()
+            # 4. Prune archive if too large
+            stats['archive_pruned'] = self._prune_archive()
 
-        # 5. Archive old sessions
-        stats['sessions_archived'] = self._archive_old_sessions()
+            # 5. Archive old sessions
+            stats['sessions_archived'] = self._archive_old_sessions()
 
-        # 6. Prune long-term memories
-        stats['ltm_pruned'] = self._prune_long_term_memories()
+            # 6. Prune long-term memories
+            stats['ltm_pruned'] = self._prune_long_term_memories()
 
-        # 7. Save changes
-        self.learning_system._save_learnings()
+            self.learning_system.mark_dirty()
+
+        # 7. Persist the whole cycle in one write
+        self.learning_system.flush()
 
         return stats
 

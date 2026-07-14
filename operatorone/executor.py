@@ -1,12 +1,21 @@
+"""Tool-call executor.
 
+Dispatches validated AI tool calls (name + typed args) to the ops modules
+through a declarative registry — no string parsing. Every call is classified
+by safety.assess(); CAUTION/DANGEROUS calls go through an injectable async
+confirmation callback, BLOCKED calls never run. Blocking work runs in a
+thread so the event loop stays responsive.
+"""
+
+import asyncio
 import subprocess
-import re
-from typing import Tuple
+import time
 from dataclasses import dataclass
-from enum import Enum
+from typing import Awaitable, Callable, Dict, Optional, Tuple
 
+import safety
+import tool_specs
 from config import Config
-from learning_system import LearningSystem
 from logger_config import op_logger
 from file_ops import FileOps
 from key_ops import KeyOps
@@ -17,25 +26,10 @@ from file_explorer_ops import FileExplorerOps
 from web_ops import WebOps
 
 
-class CommandType(Enum):
-    """Types of commands for different execution strategies"""
-    GUI_APP = "gui_app"
-    CLI_COMMAND = "cli_command"
-    POWERSHELL = "powershell"
-    BATCH = "batch"
-    FILE_OP = "file_op"       # File operations
-    KEY_OP = "key_op"         # Keyboard operations
-    WINDOW_OP = "window_op"   # Window management operations
-    CLIPBOARD_OP = "clipboard_op"  # Clipboard operations
-    PROCESS_OP = "process_op" # Process management operations
-    FILE_EXPLORER_OP = "file_explorer_op"  # File explorer operations (search, move, rename, etc.)
-    WEB_OP = "web_op"         # Web operations (search, news)
-
-
 @dataclass
 class ExecutionResult:
-    """Result of command execution"""
-    command: str
+    """Result of one tool call."""
+    command: str          # human-readable rendering of the call
     success: bool
     output: str
     error: str
@@ -45,472 +39,120 @@ class ExecutionResult:
         return self.success
 
 
+# Handler signature: (args: dict) -> (success, output, error)
+OpResult = Tuple[bool, str, str]
+
+# Type of the confirmation callback: (display, tier, reason) -> approved?
+ConfirmCallback = Callable[[str, safety.RiskTier, str], Awaitable[bool]]
+
+
+def _require(args: Dict, *names: str) -> Optional[str]:
+    """Return an error message if any required argument is missing/empty."""
+    missing = [n for n in names if args.get(n) in (None, "")]
+    if missing:
+        return f"Missing required argument(s): {', '.join(missing)}"
+    return None
+
+
 class CommandExecutor:
-    def __init__(self, memory: LearningSystem):
+    def __init__(self, memory=None, core_memory=None,
+                 confirm_callback: Optional[ConfirmCallback] = None):
+        """
+        Args:
+            memory: MemoryManager (for remember/forget tools)
+            core_memory: CoreMemory (for update_core_memory tool)
+            confirm_callback: async callback approving CAUTION/DANGEROUS calls.
+                              If absent, those calls are denied.
+        """
         self.memory = memory
+        self.core_memory = core_memory
+        self.confirm_callback = confirm_callback
         self.execution_count = 0
 
-    async def execute(self, command: str) -> ExecutionResult:
-        import time
+        self._handlers: Dict[str, Callable[[Dict], OpResult]] = {
+            "run_shell": self._run_shell,
+            "write_file": self._write_file,
+            "read_file": self._read_file,
+            "run_file": self._run_file,
+            "keyboard": self._keyboard,
+            "manage_window": self._manage_window,
+            "clipboard": self._clipboard,
+            "manage_process": self._manage_process,
+            "file_explorer": self._file_explorer,
+            "web_search": self._web_search,
+            "browser": self._browser,
+            "remember": self._remember,
+            "forget": self._forget,
+            "update_core_memory": self._update_core_memory,
+        }
+
+    async def execute_tool_call(self, name: str, arguments: Dict) -> ExecutionResult:
+        """Validate, confirm, and run one tool call."""
         start_time = time.time()
-
         self.execution_count += 1
-        op_logger.command(command)
+        display = tool_specs.format_call(name, arguments or {})
+        op_logger.command(display)
 
-        cmd_type = self._detect_command_type(command)
+        handler = self._handlers.get(name)
+        if handler is None:
+            return self._finish(display, False, "", f"Unknown tool: {name}", start_time)
 
-        if cmd_type == CommandType.FILE_OP:
-            success, output, error = self._execute_file_operation(command)
-        elif cmd_type == CommandType.KEY_OP:
-            success, output, error = self._execute_key_operation(command)
-        elif cmd_type == CommandType.WINDOW_OP:
-            success, output, error = self._execute_window_operation(command)
-        elif cmd_type == CommandType.CLIPBOARD_OP:
-            success, output, error = self._execute_clipboard_operation(command)
-        elif cmd_type == CommandType.PROCESS_OP:
-            success, output, error = self._execute_process_operation(command)
-        elif cmd_type == CommandType.FILE_EXPLORER_OP:
-            success, output, error = await self._execute_file_explorer_operation(command)
-        elif cmd_type == CommandType.WEB_OP:
-            success, output, error = self._execute_web_operation(command)
-        elif cmd_type == CommandType.GUI_APP:
-            success, output, error = await self._execute_gui_app(command)
-        elif cmd_type == CommandType.POWERSHELL:
-            success, output, error = await self._execute_powershell(command)
-        else:
-            success, output, error = await self._execute_standard(command)
+        verdict = safety.assess(name, arguments)
 
-        execution_time = time.time() - start_time
+        if verdict.tier == safety.RiskTier.BLOCKED:
+            op_logger.logger.warning(f"BLOCKED: {display} ({verdict.reason})")
+            return self._finish(
+                display, False, "",
+                f"Blocked by safety policy: {verdict.reason}", start_time
+            )
 
-        # Log result
-        op_logger.command_result(command, success, len(output) + len(error))
+        if verdict.tier in (safety.RiskTier.CAUTION, safety.RiskTier.DANGEROUS):
+            if self.confirm_callback is None:
+                return self._finish(
+                    display, False, "",
+                    "This action requires user confirmation, but no confirmation "
+                    "channel is available.", start_time
+                )
+            approved = await self.confirm_callback(display, verdict.tier, verdict.reason)
+            if not approved:
+                return self._finish(
+                    display, False, "", "User declined this action.", start_time
+                )
 
-        result = ExecutionResult(
-            command=command,
+        try:
+            success, output, error = await asyncio.to_thread(handler, arguments or {})
+        except Exception as e:
+            op_logger.logger.exception(f"Tool {name} crashed")
+            success, output, error = False, "", f"{name} error: {e}"
+
+        op_logger.command_result(display, success, len(output) + len(error))
+        return self._finish(display, success, output, error, start_time)
+
+    @staticmethod
+    def _finish(display: str, success: bool, output: str, error: str,
+                start_time: float) -> ExecutionResult:
+        return ExecutionResult(
+            command=display,
             success=success,
             output=output,
             error=error,
-            execution_time=execution_time
+            execution_time=time.time() - start_time,
         )
 
-        return result
-
-    def _detect_command_type(self, command: str) -> CommandType:
-        cmd_lower = command.lower()
-
-        if cmd_lower.startswith('file:'):
-            return CommandType.FILE_OP
-        if cmd_lower.startswith('key:'):
-            return CommandType.KEY_OP
-        if cmd_lower.startswith('window:'):
-            return CommandType.WINDOW_OP
-        if cmd_lower.startswith('clipboard:'):
-            return CommandType.CLIPBOARD_OP
-        if cmd_lower.startswith('process:'):
-            return CommandType.PROCESS_OP
-        if cmd_lower.startswith('file_explorer:'):
-            return CommandType.FILE_EXPLORER_OP
-        if cmd_lower.startswith('web:'):
-            return CommandType.WEB_OP
-        if cmd_lower.startswith('powershell'):
-            return CommandType.POWERSHELL
-        if cmd_lower.startswith('start '):
-            return CommandType.GUI_APP
-        if any(app in cmd_lower for app in Config.GUI_APPS):
-            return CommandType.GUI_APP
-        if 'shell:appsfolder' in cmd_lower:
-            return CommandType.GUI_APP
-
-        return CommandType.CLI_COMMAND
-
-    def _execute_file_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 3)
-
-            if len(parts) < 3:
-                return False, "", "Invalid file operation format"
-
-            operation = parts[1].lower()
-
-            if operation == 'create':
-                if len(parts) < 4:
-                    return False, "", "file:create requires path and content"
-                filepath = parts[2]
-                content = parts[3]
-                return FileOps.create_file(filepath, content)
-
-            elif operation == 'run':
-                filepath = parts[2]
-                return FileOps.run_file(filepath)
-
-            elif operation == 'create-run':
-                if len(parts) < 4:
-                    return False, "", "file:create-run requires path and content"
-                filepath = parts[2]
-                content = parts[3]
-                return FileOps.create_and_run(filepath, content)
-
-            else:
-                return False, "", f"Unknown file operation: {operation}"
-
-        except Exception as e:
-            return False, "", f"File operation error: {str(e)}"
-
-    def _execute_key_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 2)
-
-            if len(parts) < 3:
-                return False, "", "Invalid key operation format"
-
-            operation = parts[1].lower()
-            args = parts[2]
-
-            if operation == 'press':
-                return KeyOps.press_key(args)
-
-            elif operation == 'combo':
-                keys = args.split(':')
-                return KeyOps.key_combo(keys)
-
-            elif operation == 'type':
-                return KeyOps.type_text(args)
-
-            elif operation == 'seq':
-                keys = args.split(':')
-                return KeyOps.key_sequence(keys)
-
-            else:
-                return False, "", f"Unknown key operation: {operation}"
-
-        except Exception as e:
-            return False, "", f"Key operation error: {str(e)}"
-
-    def _execute_window_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 1)
-
-            if len(parts) < 2:
-                return False, "", "Invalid window operation format"
-
-            rest = parts[1]
-            sub_parts = rest.split(':', 1)
-            operation = sub_parts[0].lower()
-
-            if operation == 'list':
-                return WindowOps.list_windows()
-
-            elif operation == 'monitors':
-                return WindowOps.get_monitor_info()
-
-            # Operations requiring window title
-            if len(sub_parts) < 2:
-                return False, "", f"window:{operation} requires window title"
-
-            window_title = sub_parts[1]
-
-            if operation == 'focus':
-                return WindowOps.focus_window(window_title)
-
-            elif operation == 'close':
-                return WindowOps.close_window(window_title)
-
-            elif operation == 'minimize':
-                return WindowOps.minimize_window(window_title)
-
-            elif operation == 'maximize':
-                return WindowOps.maximize_window(window_title)
-
-            elif operation == 'resize':
-                # Format: window:resize:Title:width:height
-                resize_parts = window_title.rsplit(':', 2)
-                if len(resize_parts) < 3:
-                    return False, "", "window:resize requires title:width:height"
-                title, width, height = resize_parts[0], resize_parts[1], resize_parts[2]
-                try:
-                    return WindowOps.resize_window(title, int(width), int(height))
-                except ValueError:
-                    return False, "", "Width and height must be numbers"
-
-            elif operation == 'move':
-                # Format: window:move:Title:x:y
-                move_parts = window_title.rsplit(':', 2)
-                if len(move_parts) < 3:
-                    return False, "", "window:move requires title:x:y"
-                title, x, y = move_parts[0], move_parts[1], move_parts[2]
-                try:
-                    return WindowOps.move_window(title, int(x), int(y))
-                except ValueError:
-                    return False, "", "X and Y must be numbers"
-
-            elif operation == 'monitor':
-                # Format: window:monitor:Title:monitor_num
-                monitor_parts = window_title.rsplit(':', 1)
-                if len(monitor_parts) < 2:
-                    return False, "", "window:monitor requires title:monitor_number"
-                title, monitor_num = monitor_parts[0], monitor_parts[1]
-                try:
-                    return WindowOps.move_to_monitor(title, int(monitor_num))
-                except ValueError:
-                    return False, "", "Monitor number must be a number"
-
-            else:
-                return False, "", f"Unknown window operation: {operation}"
-
-        except Exception as e:
-            return False, "", f"Window operation error: {str(e)}"
-
-    def _execute_clipboard_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 2)
-
-            if len(parts) < 2:
-                return False, "", "Invalid clipboard operation format"
-
-            operation = parts[1].lower()
-
-            if operation == 'get':
-                return ClipboardOps.get_text()
-
-            elif operation == 'set':
-                if len(parts) < 3:
-                    return False, "", "clipboard:set requires text"
-                text = parts[2]
-                return ClipboardOps.set_text(text)
-
-            elif operation == 'clear':
-                return ClipboardOps.clear()
-
-            elif operation == 'copy':
-                return ClipboardOps.copy_current()
-
-            elif operation == 'paste':
-                return ClipboardOps.paste_current()
-
-            elif operation == 'image':
-                if len(parts) < 3:
-                    return False, "", "clipboard:image requires filepath"
-                filepath = parts[2]
-                return ClipboardOps.save_image(filepath)
-
-            elif operation == 'length':
-                return ClipboardOps.get_length()
-
-            elif operation == 'append':
-                if len(parts) < 3:
-                    return False, "", "clipboard:append requires text"
-                text = parts[2]
-                return ClipboardOps.append_text(text)
-
-            else:
-                return False, "", f"Unknown clipboard operation: {operation}"
-
-        except Exception as e:
-            return False, "", f"Clipboard operation error: {str(e)}"
-
-    def _execute_process_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 2)
-
-            if len(parts) < 2:
-                return False, "", "Invalid process operation format"
-
-            operation = parts[1].lower()
-
-            if operation == 'list':
-                return ProcessOps.list_processes()
-
-            elif operation == 'stats':
-                return ProcessOps.system_stats()
-
-            # Operations requiring identifier/argument
-            if len(parts) < 3:
-                return False, "", f"process:{operation} requires additional arguments"
-
-            arg = parts[2]
-
-            if operation == 'kill':
-                return ProcessOps.kill_process(arg)
-
-            elif operation == 'info':
-                return ProcessOps.process_info(arg)
-
-            elif operation == 'start':
-                return ProcessOps.start_process(arg)
-
-            elif operation == 'exists':
-                return ProcessOps.process_exists(arg)
-
-            elif operation == 'top':
-                # Format: process:top:count:metric
-                top_parts = arg.split(':', 1)
-                count = int(top_parts[0]) if top_parts[0].isdigit() else 5
-                metric = top_parts[1] if len(top_parts) > 1 else 'cpu'
-                return ProcessOps.top_processes(count, metric)
-
-            elif operation == 'priority':
-                # Format: process:priority:name:level
-                priority_parts = arg.rsplit(':', 1)
-                if len(priority_parts) < 2:
-                    return False, "", "process:priority requires name:level"
-                identifier, priority = priority_parts[0], priority_parts[1]
-                return ProcessOps.set_priority(identifier, priority)
-
-            else:
-                return False, "", f"Unknown process operation: {operation}"
-
-        except Exception as e:
-            return False, "", f"Process operation error: {str(e)}"
-
-    async def _execute_file_explorer_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 2)
-
-            if len(parts) < 2:
-                return False, "", "Invalid file_explorer operation format"
-
-            operation = parts[1].lower()
-
-            # Define sensitive operations that need confirmation
-            sensitive_ops = ['move', 'rename', 'copy', 'delete', 'delete_force', 'mkdir', 'mkdirs']
-            needs_confirmation = operation in sensitive_ops
-
-            # Operations without arguments
-            if operation == 'list':
-                if len(parts) >= 3:
-                    return FileExplorerOps.list_directory(parts[2])
-                else:
-                    return FileExplorerOps.list_directory()
-
-            # Operations requiring path/arguments
-            if len(parts) < 3:
-                return False, "", f"file_explorer:{operation} requires additional arguments"
-
-            arg = parts[2]
-
-            if needs_confirmation:
-                descriptions = {
-                    'mkdir': f"Create directory: {arg}",
-                    'mkdirs': f"Create nested directories: {arg}",
-                    'delete': f"Delete file/folder: {arg}",
-                    'delete_force': f"Force delete folder (including all contents): {arg}"
-                }
-
-                # For operations with source:dest format
-                if operation in ['move', 'rename', 'copy']:
-                    args_split = arg.split(':', 1)
-                    if len(args_split) == 2:
-                        source, dest = args_split
-                        descriptions_multi = {
-                            'move': f"Move {source} to {dest}",
-                            'rename': f"Rename {source} to {dest}",
-                            'copy': f"Copy {source} to {dest}"
-                        }
-                        description = descriptions_multi.get(operation, f"Execute: {command}")
-                    else:
-                        description = f"Execute: {command}"
-                else:
-                    description = descriptions.get(operation, f"Execute: {command}")
-
-                confirmed = await self._request_user_confirmation(command, description)
-
-                if not confirmed:
-                    return False, "Operation cancelled by user", ""
-
-            # Execute the operation
-            if operation == 'search':
-                # Format: file_explorer:search:pattern:path
-                search_parts = arg.split(':', 1)
-                pattern = search_parts[0]
-                path = search_parts[1] if len(search_parts) > 1 else None
-                return FileExplorerOps.search_files(pattern, path)
-
-            elif operation == 'storage':
-                return FileExplorerOps.get_storage_usage(arg)
-
-            elif operation == 'mkdir':
-                return FileExplorerOps.create_directory(arg, nested=False)
-
-            elif operation == 'mkdirs':
-                return FileExplorerOps.create_directory(arg, nested=True)
-
-            elif operation == 'move':
-                # Format: file_explorer:move:source:dest
-                move_parts = arg.split(':', 1)
-                if len(move_parts) != 2:
-                    return False, "", "move requires source:dest format"
-                return FileExplorerOps.move_item(move_parts[0], move_parts[1])
-
-            elif operation == 'rename':
-                # Format: file_explorer:rename:old_path:new_name
-                rename_parts = arg.split(':', 1)
-                if len(rename_parts) != 2:
-                    return False, "", "rename requires old_path:new_name format"
-                return FileExplorerOps.rename_item(rename_parts[0], rename_parts[1])
-
-            elif operation == 'copy':
-                # Format: file_explorer:copy:source:dest
-                copy_parts = arg.split(':', 1)
-                if len(copy_parts) != 2:
-                    return False, "", "copy requires source:dest format"
-                return FileExplorerOps.copy_item(copy_parts[0], copy_parts[1])
-
-            elif operation == 'delete':
-                return FileExplorerOps.delete_item(arg, force=False)
-
-            elif operation == 'delete_force':
-                return FileExplorerOps.delete_item(arg, force=True)
-
-            elif operation == 'info':
-                return FileExplorerOps.get_item_info(arg)
-
-            else:
-                return False, "", f"Unknown file_explorer operation: {operation}"
-
-        except Exception as e:
-            return False, "", f"File explorer operation error: {str(e)}"
-
-    def _execute_web_operation(self, command: str) -> Tuple[bool, str, str]:
-        try:
-            parts = command.split(':', 2)
-
-            if len(parts) < 3:
-                return False, "", "Invalid web operation format. Use: web:search:query or web:news:query"
-
-            operation = parts[1].lower()
-            query_and_limit = parts[2]
-
-            # Check if max_results is specified (format: query:max_results)
-            query_parts = query_and_limit.rsplit(':', 1)
-            if len(query_parts) == 2 and query_parts[1].isdigit():
-                query = query_parts[0]
-                max_results = int(query_parts[1])
-            else:
-                query = query_and_limit
-                max_results = 5  # Default
-
-            # Execute the operation
-            if operation == 'search':
-                return WebOps.search(query, max_results)
-            elif operation == 'news':
-                return WebOps.search_news(query, max_results)
-            else:
-                return False, "", f"Unknown web operation: {operation}. Use 'search' or 'news'"
-
-        except Exception as e:
-            op_logger.logger.error(f"Web operation error: {e}")
-            return False, "", f"Web operation error: {str(e)}"
-
-    async def _request_user_confirmation(self, command: str, description: str) -> bool:
-        print(f"\n[Confirm] {description}")
-        try:
-            response = input("Allow? [y/N]: ").strip().lower()
-            return response in ('y', 'yes')
-        except (EOFError, KeyboardInterrupt):
-            return False
-
-    async def _execute_gui_app(self, command: str) -> Tuple[bool, str, str]:
-        command = self._prepare_command(command)
+    # ==================== Handlers ====================
+
+    def _run_shell(self, args: Dict) -> OpResult:
+        if err := _require(args, "command"):
+            return False, "", err
+        command = str(args["command"]).strip()
+        shell = str(args.get("shell", "cmd")).lower()
+
+        if shell == "powershell" and not command.lower().startswith("powershell"):
+            command = f'powershell -NoProfile -NonInteractive -Command "{command}"'
+
+        # App/URL launches return immediately; treat a quick timeout as success
+        is_launch = command.lower().startswith(("start ", "explorer"))
+        timeout = 5 if is_launch else Config.COMMAND_TIMEOUT
 
         try:
             result = subprocess.run(
@@ -518,132 +160,269 @@ class CommandExecutor:
                 shell=True,
                 capture_output=True,
                 text=True,
-                timeout=5,
+                timeout=timeout,
                 encoding='utf-8',
                 errors='replace',
-                cwd=Config.HOME_DIR
+                cwd=Config.HOME_DIR,
             )
-
-            success = result.returncode == 0
-
-            if success:
-                output = "✓ Application launched"
-                error = ""
-            else:
-                output = result.stdout if result.stdout else ""
-                error = result.stderr if result.stderr else "Application failed to start"
-
-            return success, output, error
-
         except subprocess.TimeoutExpired:
-            return True, "✓ Application launched", ""
-
+            if is_launch:
+                return True, "Application launched", ""
+            return False, "", f"Command timeout ({timeout}s)"
         except Exception as e:
-            return False, "", f"Execution error: {str(e)}"
+            return False, "", f"Execution error: {e}"
 
-    async def _execute_powershell(self, command: str) -> Tuple[bool, str, str]:
-        if '-NonInteractive' not in command:
-            command = command.replace('powershell ', 'powershell -NonInteractive ', 1)
+        output = (result.stdout or "").strip()
+        error = (result.stderr or "").strip()
+        success = result.returncode == 0
 
-        if '-Command' in command and '$ErrorActionPreference' not in command:
-            command = command.replace(
-                '-Command "',
-                '-Command "$ErrorActionPreference=\'Stop\'; ',
-                1
-            )
-            if not command.rstrip().endswith('"'):
-                command = command.rstrip() + '"'
+        if not success and not error:
+            error = f"Command exited with code {result.returncode}"
+        if success and is_launch and not output:
+            output = "Application launched"
 
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=Config.COMMAND_TIMEOUT,
-                encoding='utf-8',
-                errors='replace',
-                cwd=Config.HOME_DIR
-            )
+        # Cap huge outputs before they hit the model context
+        if len(output) > Config.MAX_OUTPUT_LENGTH:
+            output = output[:Config.MAX_OUTPUT_LENGTH] + "\n... (output truncated)"
 
-            output = result.stdout.strip() if result.stdout else ""
-            error = result.stderr.strip() if result.stderr else ""
+        return success, output, error
 
-            success = result.returncode == 0 and not self._has_powershell_error(error, output)
+    def _write_file(self, args: Dict) -> OpResult:
+        if err := _require(args, "path", "content"):
+            return False, "", err
+        return FileOps.create_file(str(args["path"]), str(args["content"]))
 
-            if success and not output and 'Stop-Process' in command:
-                output = "✓ Process terminated"
+    def _read_file(self, args: Dict) -> OpResult:
+        if err := _require(args, "path"):
+            return False, "", err
+        return FileOps.read_file(str(args["path"]))
 
-            return success, output, error
+    def _run_file(self, args: Dict) -> OpResult:
+        if err := _require(args, "path"):
+            return False, "", err
+        return FileOps.run_file(str(args["path"]))
 
-        except subprocess.TimeoutExpired:
-            return False, "", f"Command timeout ({Config.COMMAND_TIMEOUT}s)"
+    def _keyboard(self, args: Dict) -> OpResult:
+        action = str(args.get("action", "")).lower()
+        keys = [str(k) for k in (args.get("keys") or [])]
+        text = str(args.get("text", ""))
 
-        except Exception as e:
-            return False, "", f"Execution error: {str(e)}"
+        if action == "press":
+            if not keys:
+                return False, "", "keyboard press requires keys"
+            return KeyOps.press_key(keys[0])
+        if action == "combo":
+            if not keys:
+                return False, "", "keyboard combo requires keys"
+            return KeyOps.key_combo(keys)
+        if action == "type":
+            if not text:
+                return False, "", "keyboard type requires text"
+            return KeyOps.type_text(text)
+        if action == "sequence":
+            if not keys:
+                return False, "", "keyboard sequence requires keys"
+            return KeyOps.key_sequence(keys)
+        return False, "", f"Unknown keyboard action: {action}"
 
-    async def _execute_standard(self, command: str) -> Tuple[bool, str, str]:
-        command = self._prepare_command(command)
+    def _manage_window(self, args: Dict) -> OpResult:
+        action = str(args.get("action", "")).lower()
+        title = str(args.get("title", ""))
 
-        try:
-            result = subprocess.run(
-                command,
-                shell=True,
-                capture_output=True,
-                text=True,
-                timeout=Config.COMMAND_TIMEOUT,
-                encoding='utf-8',
-                errors='replace',
-                cwd=Config.HOME_DIR
-            )
+        if action == "list":
+            return WindowOps.list_windows()
+        if action == "monitors":
+            return WindowOps.get_monitor_info()
 
-            output = result.stdout.strip() if result.stdout else ""
-            error = result.stderr.strip() if result.stderr else ""
+        if not title:
+            return False, "", f"manage_window {action} requires a title"
 
-            success = result.returncode == 0
+        if action == "focus":
+            return WindowOps.focus_window(title)
+        if action == "close":
+            return WindowOps.close_window(title)
+        if action == "minimize":
+            return WindowOps.minimize_window(title)
+        if action == "maximize":
+            return WindowOps.maximize_window(title)
+        if action == "resize":
+            if err := _require(args, "width", "height"):
+                return False, "", err
+            return WindowOps.resize_window(title, int(args["width"]), int(args["height"]))
+        if action == "move":
+            if args.get("x") is None or args.get("y") is None:
+                return False, "", "manage_window move requires x and y"
+            return WindowOps.move_window(title, int(args["x"]), int(args["y"]))
+        if action == "to_monitor":
+            if err := _require(args, "monitor"):
+                return False, "", err
+            return WindowOps.move_to_monitor(title, int(args["monitor"]))
+        return False, "", f"Unknown window action: {action}"
 
-            if success and error:
-                if self._contains_error_indicators(error):
-                    success = False
+    def _clipboard(self, args: Dict) -> OpResult:
+        action = str(args.get("action", "")).lower()
+        if action == "get":
+            return ClipboardOps.get_text()
+        if action == "set":
+            if err := _require(args, "text"):
+                return False, "", err
+            return ClipboardOps.set_text(str(args["text"]))
+        if action == "append":
+            if err := _require(args, "text"):
+                return False, "", err
+            return ClipboardOps.append_text(str(args["text"]))
+        if action == "clear":
+            return ClipboardOps.clear()
+        if action == "copy":
+            return ClipboardOps.copy_current()
+        if action == "paste":
+            return ClipboardOps.paste_current()
+        if action == "save_image":
+            if err := _require(args, "path"):
+                return False, "", err
+            return ClipboardOps.save_image(str(args["path"]))
+        return False, "", f"Unknown clipboard action: {action}"
 
-            if not success and not error:
-                error = f"Command exited with code {result.returncode}"
+    def _manage_process(self, args: Dict) -> OpResult:
+        action = str(args.get("action", "")).lower()
+        name = str(args.get("name", ""))
 
-            return success, output, error
+        if action == "list":
+            return ProcessOps.list_processes()
+        if action == "stats":
+            return ProcessOps.system_stats()
+        if action == "top":
+            count = int(args.get("count") or 5)
+            sort_by = str(args.get("sort_by") or "cpu")
+            return ProcessOps.top_processes(count, sort_by)
 
-        except subprocess.TimeoutExpired:
-            return False, "", f"Command timeout ({Config.COMMAND_TIMEOUT}s)"
+        if not name:
+            return False, "", f"manage_process {action} requires a name"
 
-        except Exception as e:
-            return False, "", f"Execution error: {str(e)}"
+        if action == "kill":
+            return ProcessOps.kill_process(name)
+        if action == "info":
+            return ProcessOps.process_info(name)
+        if action == "exists":
+            return ProcessOps.process_exists(name)
+        return False, "", f"Unknown process action: {action}"
 
-    def _prepare_command(self, command: str) -> str:
-        return command.strip()
+    def _file_explorer(self, args: Dict) -> OpResult:
+        action = str(args.get("action", "")).lower()
+        path = args.get("path")
+        path_str = str(path) if path not in (None, "") else None
 
-    def _has_powershell_error(self, stderr: str, stdout: str) -> bool:
-        if not stderr:
-            return False
+        if action == "search":
+            if err := _require(args, "pattern"):
+                return False, "", err
+            return FileExplorerOps.search_files(str(args["pattern"]), path_str)
+        if action == "list":
+            return FileExplorerOps.list_directory(path_str)
+        if action == "storage":
+            return FileExplorerOps.get_storage_usage(path_str)
 
-        error_patterns = [
-            'error', 'exception', 'cannot find', 'does not exist',
-            'not recognized', 'access is denied', 'invalid operation',
-            'failed to', 'unable to'
-        ]
+        if not path_str:
+            return False, "", f"file_explorer {action} requires a path"
 
-        stderr_lower = stderr.lower()
-        return any(pattern in stderr_lower for pattern in error_patterns)
+        if action == "info":
+            return FileExplorerOps.get_item_info(path_str)
+        if action == "mkdir":
+            return FileExplorerOps.create_directory(path_str, nested=True)
+        if action == "move":
+            if err := _require(args, "destination"):
+                return False, "", err
+            return FileExplorerOps.move_item(path_str, str(args["destination"]))
+        if action == "copy":
+            if err := _require(args, "destination"):
+                return False, "", err
+            return FileExplorerOps.copy_item(path_str, str(args["destination"]))
+        if action == "rename":
+            if err := _require(args, "new_name"):
+                return False, "", err
+            return FileExplorerOps.rename_item(path_str, str(args["new_name"]))
+        if action == "delete":
+            return FileExplorerOps.delete_item(path_str, force=False)
+        if action == "delete_force":
+            return FileExplorerOps.delete_item(path_str, force=True)
+        return False, "", f"Unknown file_explorer action: {action}"
 
-    def _contains_error_indicators(self, text: str) -> bool:
-        if not text:
-            return False
+    def _web_search(self, args: Dict) -> OpResult:
+        if err := _require(args, "query"):
+            return False, "", err
+        query = str(args["query"])
+        max_results = int(args.get("max_results") or 5)
+        if args.get("news"):
+            return WebOps.search_news(query, max_results)
+        return WebOps.search(query, max_results)
 
-        error_indicators = [
-            'error', 'exception', 'failed', 'failure', 'cannot', 'unable',
-            'not found', 'not recognized', 'access is denied', 'permission denied',
-            'syntax error', 'unexpected token', 'missing', 'invalid',
-            'does not exist', 'no such', 'not available',
-            'unauthorized', 'forbidden'
-        ]
+    def _browser(self, args: Dict) -> OpResult:
+        from browser_bridge import BrowserBridge
 
-        text_lower = text.lower()
-        return any(indicator in text_lower for indicator in error_indicators)
+        action = str(args.get("action", "")).lower()
+        if action not in ("tabs", "open", "navigate", "read", "click", "fill", "close_tab"):
+            return False, "", f"Unknown browser action: {action}"
+        if action in ("open", "navigate") and (err := _require(args, "url")):
+            return False, "", err
+        if action in ("click", "fill") and args.get("element") is None and not args.get("selector"):
+            return False, "", f"browser {action} requires element (from read) or selector"
+        if action == "fill" and (err := _require(args, "text")):
+            return False, "", err
+
+        params = {k: args[k] for k in
+                  ("url", "tab_id", "element", "selector", "text", "submit")
+                  if args.get(k) is not None}
+        return BrowserBridge.get().request(action, params)
+
+    def _remember(self, args: Dict) -> OpResult:
+        if self.memory is None:
+            return False, "", "Memory is not available"
+        if err := _require(args, "content"):
+            return False, "", err
+        category = args.get("category", "general")
+        if category not in ("personal", "technical", "general"):
+            category = "general"
+        tags = [str(t) for t in (args.get("tags") or [])]
+        fact_id = self.memory.remember_fact(
+            category=category,
+            content=str(args["content"]),
+            source="explicit",
+            tags=tags,
+        )
+        return True, f"Remembered ({fact_id})", ""
+
+    def _forget(self, args: Dict) -> OpResult:
+        if self.memory is None:
+            return False, "", "Memory is not available"
+        if err := _require(args, "fact_id"):
+            return False, "", err
+        fact_id = str(args["fact_id"])
+        if self.memory.forget_fact(fact_id):
+            return True, f"Forgot {fact_id}", ""
+        return False, "", f"No fact with id {fact_id}"
+
+    def _update_core_memory(self, args: Dict) -> OpResult:
+        if self.core_memory is None:
+            return False, "", "Core memory is not available"
+        if err := _require(args, "section", "value"):
+            return False, "", err
+        section = str(args["section"]).lower()
+        key = str(args.get("key", ""))
+        value = str(args["value"])
+
+        if section == "identity":
+            if key not in ("name", "profession", "location"):
+                return False, "", "identity requires key of name/profession/location"
+            self.core_memory.set_identity(key, value)
+            return True, f"Core identity.{key} set", ""
+        if section == "preference":
+            if not key:
+                return False, "", "preference requires a key"
+            self.core_memory.add_preference(key, value)
+            return True, f"Core preference {key} set", ""
+        if section == "project":
+            self.core_memory.add_project(value)
+            return True, "Project added to core memory", ""
+        if section == "important_fact":
+            self.core_memory.add_custom_fact(value)
+            return True, "Fact added to core memory", ""
+        return False, "", f"Unknown core memory section: {section}"

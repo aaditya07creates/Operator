@@ -1,5 +1,7 @@
+import atexit
 import json
 import os
+import threading
 from datetime import datetime, timedelta
 from typing import Dict, List, Any, Optional
 from collections import defaultdict
@@ -10,7 +12,14 @@ from paths import Paths
 
 
 class LearningSystem:
-    """Manages persistent learnings with intelligent context generation"""
+    """Manages persistent learnings with intelligent context generation.
+
+    Thread safety: `self.lock` (an RLock) must be held for any read or
+    mutation of `self.learnings`, which is shared across threads (e.g. the
+    overlay's background asyncio loop). Mutators call `mark_dirty()`; the
+    actual disk write happens in `flush()`, called once per interaction and
+    at exit.
+    """
 
     def __init__(self, learning_file: str = None):
         """
@@ -27,7 +36,10 @@ class LearningSystem:
         else:
             self.learning_file = learning_file
 
+        self.lock = threading.RLock()
+        self._dirty = False
         self.learnings = self._load_learnings()
+        atexit.register(self.flush)
 
     def _get_default_structure(self) -> Dict:
         """Optimized learning structure v4.0 - Tiered Jarvis Memory"""
@@ -65,9 +77,7 @@ class LearningSystem:
                     #   "last_accessed": "ISO timestamp",
                     #   "access_count": 0
                     # }
-                ],
-                "rules": [],
-                "relationships": []
+                ]
             },
             "conversation_memory": {
                 "sessions": [],
@@ -96,46 +106,60 @@ class LearningSystem:
                 "failures": 0,
                 "success_rate": 0.0,
                 "version": "4.0",
-                "total_facts": 0,
-                "total_rules": 0,
-                "total_sessions": 0,
-                "knowledge_growth_rate": 0.0
+                "total_facts": 0
             }
         }
 
     def _load_learnings(self) -> Dict:
-        """Load learnings from file"""
-        if os.path.exists(self.learning_file):
+        """Load learnings from file, falling back to the backup on corruption."""
+        for path, is_backup in ((self.learning_file, False), (f"{self.learning_file}.bak", True)):
+            if not os.path.exists(path):
+                continue
             try:
-                with open(self.learning_file, 'r', encoding='utf-8') as f:
+                with open(path, 'r', encoding='utf-8') as f:
                     learnings = json.load(f)
-                    version = learnings.get("metadata", {}).get("version", "1.0")
-
-                    # Migrate from v1 to v2 if needed
-                    if version == "1.0":
-                        learnings = self._migrate_to_v2(learnings)
-                        version = "2.0"
-
-                    # Migrate from v2 to v3 if needed
-                    if version == "2.0":
-                        learnings = self._migrate_to_v3(learnings)
-                        version = "3.0"
-
-                    # Migrate from v3 to v4 if needed
-                    if version == "3.0":
-                        learnings = self._migrate_to_v4(learnings)
-                        version = "4.0"
-
-                    # Ensure all sections exist
-                    default = self._get_default_structure()
-                    for key in default:
-                        if key not in learnings:
-                            learnings[key] = default[key]
-                    return learnings
             except Exception as e:
-                op_logger.logger.error(f"Error loading learnings: {e}")
-                return self._get_default_structure()
+                op_logger.logger.error(f"Error loading {'backup' if is_backup else 'learnings'}: {e}")
+                if not is_backup:
+                    self._quarantine_corrupt_file()
+                continue
+
+            if is_backup:
+                op_logger.logger.warning("Recovered memory from backup file")
+
+            version = learnings.get("metadata", {}).get("version", "1.0")
+
+            if version == "1.0":
+                learnings = self._migrate_to_v2(learnings)
+                version = "2.0"
+
+            if version == "2.0":
+                learnings = self._migrate_to_v3(learnings)
+                version = "3.0"
+
+            if version == "3.0":
+                learnings = self._migrate_to_v4(learnings)
+                version = "4.0"
+
+            # Ensure all sections exist
+            default = self._get_default_structure()
+            for key in default:
+                if key not in learnings:
+                    learnings[key] = default[key]
+            return learnings
+
         return self._get_default_structure()
+
+    def _quarantine_corrupt_file(self):
+        """Preserve a corrupt learnings file for manual recovery instead of overwriting it."""
+        try:
+            corrupt_path = f"{self.learning_file}.corrupt"
+            if os.path.exists(corrupt_path):
+                os.remove(corrupt_path)
+            os.replace(self.learning_file, corrupt_path)
+            op_logger.logger.warning(f"Corrupt memory file preserved at {corrupt_path}")
+        except Exception as e:
+            op_logger.logger.error(f"Could not quarantine corrupt file: {e}")
 
     def _migrate_to_v2(self, old_data: Dict) -> Dict:
         """Migrate v1 learning structure to v2"""
@@ -303,17 +327,46 @@ class LearningSystem:
                 fixes_list = fixes_list[-3:]
             fix_patterns[category] = fixes_list
 
+    def mark_dirty(self):
+        """Record that in-memory state has changed; written to disk on next flush()."""
+        with self.lock:
+            self._dirty = True
+
+    def flush(self):
+        """Write to disk if there are unsaved changes."""
+        with self.lock:
+            if self._dirty:
+                self._save_learnings()
+
     def _save_learnings(self):
-        """Save learnings to file"""
-        try:
-            self.learnings["metadata"]["last_updated"] = datetime.now().isoformat()
-            with open(self.learning_file, 'w', encoding='utf-8') as f:
-                json.dump(self.learnings, f, indent=2, ensure_ascii=False)
-            op_logger.logger.debug(f"Learnings saved to {self.learning_file}")
-        except Exception as e:
-            op_logger.logger.error(f"Error saving learnings: {e}")
-            import traceback
-            traceback.print_exc()
+        """Atomically save learnings: write temp file, rotate backup, replace.
+
+        A crash mid-write can never corrupt the real file, and the previous
+        version always survives as .bak.
+        """
+        with self.lock:
+            tmp_file = f"{self.learning_file}.tmp"
+            try:
+                self.learnings["metadata"]["last_updated"] = datetime.now().isoformat()
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(self.learnings, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+
+                if os.path.exists(self.learning_file):
+                    backup = f"{self.learning_file}.bak"
+                    try:
+                        if os.path.exists(backup):
+                            os.remove(backup)
+                        os.replace(self.learning_file, backup)
+                    except Exception as e:
+                        op_logger.logger.warning(f"Could not rotate backup: {e}")
+
+                os.replace(tmp_file, self.learning_file)
+                self._dirty = False
+                op_logger.logger.debug(f"Learnings saved to {self.learning_file}")
+            except Exception as e:
+                op_logger.logger.error(f"Error saving learnings: {e}")
 
     # ========================
     # Core Learning Operations
@@ -334,22 +387,22 @@ class LearningSystem:
             self.learnings["command_memory"]["apps"][app_name]["process_name"] = process_name
 
         self.learnings["command_memory"]["apps"][app_name]["last_used"] = datetime.now().isoformat()
-        self._save_learnings()
+        self.mark_dirty()
 
     def learn_pattern(self, pattern_id: str, description: str):
         """Learn a successful pattern (max 100 chars)"""
         self.learnings["command_memory"]["patterns"][pattern_id] = description[:100]
-        self._save_learnings()
+        self.mark_dirty()
 
     def learn_preference(self, key: str, value: Any):
         """Learn user preference"""
         self.learnings["command_memory"]["preferences"][key] = value
-        self._save_learnings()
+        self.mark_dirty()
 
     def learn_task(self, task_name: str, commands: List[str]):
         """Learn multi-step task"""
         self.learnings["command_memory"]["tasks"][task_name.lower()] = commands
-        self._save_learnings()
+        self.mark_dirty()
 
     def record_command_fix(self, original: str, fix: str, error: str = ""):
         """Record a command fix, categorized by error type"""
@@ -383,7 +436,7 @@ class LearningSystem:
             reverse=True
         )[:3]
 
-        self._save_learnings()
+        self.mark_dirty()
 
     # ========================
     # Retrieval Operations
@@ -432,7 +485,7 @@ class LearningSystem:
         successes = self.learnings["metadata"]["successes"]
         self.learnings["metadata"]["success_rate"] = round(successes / total, 3) if total > 0 else 0.0
 
-        self._save_learnings()
+        self.mark_dirty()
 
     # ========================
     # AI Integration (Simplified)
@@ -482,19 +535,19 @@ class LearningSystem:
 
             if learning_type == "app" and identifier in self.learnings["command_memory"]["apps"]:
                 del self.learnings["command_memory"]["apps"][identifier]
-                self._save_learnings()
+                self.mark_dirty()
                 return True
             elif learning_type == "pattern" and identifier in self.learnings["command_memory"]["patterns"]:
                 del self.learnings["command_memory"]["patterns"][identifier]
-                self._save_learnings()
+                self.mark_dirty()
                 return True
             elif learning_type == "preference" and identifier in self.learnings["command_memory"]["preferences"]:
                 del self.learnings["command_memory"]["preferences"][identifier]
-                self._save_learnings()
+                self.mark_dirty()
                 return True
             elif learning_type == "task" and identifier in self.learnings["command_memory"]["tasks"]:
                 del self.learnings["command_memory"]["tasks"][identifier]
-                self._save_learnings()
+                self.mark_dirty()
                 return True
 
             return False
@@ -514,19 +567,19 @@ class LearningSystem:
                     self.learnings["command_memory"]["apps"][identifier]["path"] = new_data["path"]
                 if "strategy" in new_data:
                     self.learnings["command_memory"]["apps"][identifier]["strategy"] = new_data["strategy"]
-                self._save_learnings()
+                self.mark_dirty()
                 return True
             elif learning_type == "pattern" and identifier in self.learnings["command_memory"]["patterns"]:
                 self.learnings["command_memory"]["patterns"][identifier] = new_data.get("description")
-                self._save_learnings()
+                self.mark_dirty()
                 return True
             elif learning_type == "preference" and identifier in self.learnings["command_memory"]["preferences"]:
                 self.learnings["command_memory"]["preferences"][identifier] = new_data.get("value")
-                self._save_learnings()
+                self.mark_dirty()
                 return True
             elif learning_type == "task" and identifier in self.learnings["command_memory"]["tasks"]:
                 self.learnings["command_memory"]["tasks"][identifier] = new_data.get("commands", [])
-                self._save_learnings()
+                self.mark_dirty()
                 return True
 
             return False
@@ -592,11 +645,6 @@ class LearningSystem:
     def get_similar_fixes(self, error: str) -> List[Dict]:
         """Get similar command fixes (for retry logic)"""
         return self.get_relevant_fixes(error)
-
-    def record_failed_attempt(self, command: str, error: str):
-        """Track failed attempts (used for statistics only)"""
-        # In v2, we don't store individual failures, just update stats
-        pass
 
     def get_full_summary(self) -> str:
         """Get complete summary for /learnings command"""
@@ -685,7 +733,7 @@ class LearningSystem:
             del self.learnings["command_memory"]["apps"][app]
 
         if to_remove:
-            self._save_learnings()
+            self.mark_dirty()
 
     def reset_learnings(self):
         """Reset all learnings"""

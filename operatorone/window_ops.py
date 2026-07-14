@@ -487,8 +487,10 @@ class WindowOps:
                 left, top, right, bottom = win32gui.GetWindowRect(hwnd)
                 width = right - left
                 height = bottom - top
-                win32gui.MoveWindow(hwnd, x, y, width, height, True)
-                return True, f"✓ Moved {title} to ({x}, {y})", ""
+                center_x = target_monitor['left'] + (target_monitor['width'] - width) // 2
+                center_y = target_monitor['top'] + (target_monitor['height'] - height) // 2
+                win32gui.MoveWindow(hwnd, center_x, center_y, width, height, True)
+                return True, f"✓ Moved {title} to Monitor {monitor_num}", ""
 
             else:
                 return False, "", "Window operations require pygetwindow or pywin32"

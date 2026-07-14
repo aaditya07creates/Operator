@@ -1,0 +1,35 @@
+[project]
+name = "operatorone"
+version = "5.0.0"
+description = "OPERATOR — an AI desktop assistant for Windows with native tool-calling, tiered memory, and a global-hotkey overlay."
+requires-python = ">=3.10"
+readme = "README.md"
+dependencies = [
+    "psutil>=5.9.0",
+    "rich>=13.0.0",
+    "prompt_toolkit>=3.0.0",
+    "mistralai>=1.0.0",
+    "google-generativeai>=0.8.0",
+    "pynput>=1.7.6",
+    "pygetwindow>=0.0.9",
+    "pywin32>=305",
+    "pyperclip>=1.8.2",
+    "mss>=9.0.1",
+    "Pillow>=10.0.0",
+    "ddgs>=9.10.0",
+    "websockets>=12.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+voice = [
+    "faster-whisper>=1.0",
+    "sounddevice>=0.4",
+    "numpy>=1.24",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-q"

@@ -1,22 +1,11 @@
 from typing import List, Dict, Optional, Set
-from datetime import datetime, timedelta
-import re
-from collections import Counter
+from datetime import datetime
+
+import memory_utils
 
 
 class ContextRetriever:
     """Smart context retrieval with relevance scoring"""
-
-    # Common English stopwords to filter out
-    STOPWORDS = {
-        'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-        'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
-        'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will',
-        'would', 'should', 'could', 'may', 'might', 'can', 'this', 'that',
-        'these', 'those', 'i', 'you', 'he', 'she', 'it', 'we', 'they', 'what',
-        'which', 'who', 'when', 'where', 'why', 'how', 'my', 'your', 'his',
-        'her', 'its', 'our', 'their', 'me', 'him', 'her', 'us', 'them'
-    }
 
     def __init__(self, learning_system):
         """
@@ -48,7 +37,8 @@ class ContextRetriever:
             List of fact dictionaries, sorted by relevance score
         """
         # Get Tier 2 (active) facts only - Tier 1 is in system prompt, Tier 4 is archived
-        all_facts = self.learning_system.learnings.get("knowledge_base", {}).get("facts", [])
+        with self.learning_system.lock:
+            all_facts = list(self.learning_system.learnings.get("knowledge_base", {}).get("facts", []))
         facts = [f for f in all_facts if f.get("tier", 2) == 2]
 
         if not facts:
@@ -64,21 +54,33 @@ class ContextRetriever:
 
         if not query_keywords:
             # No keywords - return most recent high-confidence facts
-            return sorted(
+            selected = sorted(
                 facts,
                 key=lambda f: (f.get("confidence", 0), f.get("learned_at", "")),
                 reverse=True
             )[:limit]
+        else:
+            scored_facts = [(self._calculate_relevance(f, query_keywords), f) for f in facts]
+            scored_facts.sort(key=lambda x: x[0], reverse=True)
+            selected = [fact for score, fact in scored_facts[:limit] if score > 0]
 
-        # Score each fact
-        scored_facts = []
-        for fact in facts:
-            score = self._calculate_relevance(fact, query_keywords)
-            scored_facts.append((score, fact))
+        # Retrieval counts as access: keeps frequency/recency scoring alive
+        # and protects retrieved facts from stale-fact auto-demotion
+        self._record_access(selected)
+        return selected
 
-        # Sort by score and return top N
-        scored_facts.sort(key=lambda x: x[0], reverse=True)
-        return [fact for score, fact in scored_facts[:limit]]
+    def _record_access(self, facts: List[Dict]):
+        """Bump access stats for retrieved facts (debounced save via mark_dirty)."""
+        if not facts:
+            return
+        now = datetime.now().isoformat()
+        ids = {f.get("id") for f in facts}
+        with self.learning_system.lock:
+            for fact in self.learning_system.learnings.get("knowledge_base", {}).get("facts", []):
+                if fact.get("id") in ids:
+                    fact["last_accessed"] = now
+                    fact["access_count"] = fact.get("access_count", 0) + 1
+            self.learning_system.mark_dirty()
 
     def get_relevant_context_for_ai(
         self,
@@ -159,19 +161,12 @@ class ContextRetriever:
         Returns:
             Set of lowercase keywords
         """
-        # Check cache
-        cache_key = text.lower()[:100]  # Cache first 100 chars
+        # Cache on the full text so distinct texts can never collide
+        cache_key = text.lower()
         if cache_key in self._keyword_cache:
             return self._keyword_cache[cache_key]
 
-        # Tokenize - split on non-alphanumeric, keep letters/numbers
-        tokens = re.findall(r'\b[a-zA-Z0-9]+\b', text.lower())
-
-        # Filter stopwords and short words
-        keywords = {
-            token for token in tokens
-            if token not in self.STOPWORDS and len(token) > 2
-        }
+        keywords = memory_utils.extract_keywords(text)
 
         # Cache result
         self._keyword_cache[cache_key] = keywords
@@ -192,7 +187,7 @@ class ContextRetriever:
         """
         Calculate relevance score for a fact.
 
-        Score = keyword_match * 0.5 + recency * 0.3 + frequency * 0.2 + confidence * 0.1
+        Score = keyword_match * 0.5 + recency * 0.3 + frequency * 0.1 + confidence * 0.1
 
         Args:
             fact: Fact dictionary
@@ -201,13 +196,14 @@ class ContextRetriever:
         Returns:
             Relevance score (0.0 - 1.0)
         """
-        # 1. Keyword matching score (0.0 - 1.0)
+        # 1. Keyword matching score (0.0 - 1.0): overlap normalized by the
+        # smaller keyword set, so long queries don't dilute strong matches
         fact_keywords = self._extract_keywords(fact.get("content", ""))
-        if not fact_keywords:
+        if not fact_keywords or not query_keywords:
             keyword_score = 0.0
         else:
             matching_keywords = fact_keywords & query_keywords
-            keyword_score = len(matching_keywords) / max(len(query_keywords), 1)
+            keyword_score = len(matching_keywords) / min(len(query_keywords), len(fact_keywords))
 
         # 2. Recency score (0.0 - 1.0)
         recency_score = self._calculate_recency_score(fact)

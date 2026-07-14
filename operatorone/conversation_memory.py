@@ -1,7 +1,9 @@
-from typing import List, Dict, Optional, Tuple
-from datetime import datetime, timedelta
+from typing import List, Dict, Optional
+from datetime import datetime
 from collections import Counter
 import uuid
+
+import memory_utils
 
 
 class ConversationMemory:
@@ -48,14 +50,17 @@ class ConversationMemory:
         summary = self._create_session_summary()
 
         # Save to learning system
-        sessions = self.learning_system.learnings["conversation_memory"]["sessions"]
-        sessions.append(summary)
+        with self.learning_system.lock:
+            sessions = self.learning_system.learnings["conversation_memory"]["sessions"]
+            sessions.append(summary)
 
-        # Keep only last 20 sessions
-        if len(sessions) > 20:
-            self.learning_system.learnings["conversation_memory"]["sessions"] = sessions[-20:]
+            # Keep only last 20 sessions
+            if len(sessions) > 20:
+                self.learning_system.learnings["conversation_memory"]["sessions"] = sessions[-20:]
 
-        self.learning_system._save_learnings()
+            self.learning_system.mark_dirty()
+        # Session end is a durable event — persist immediately
+        self.learning_system.flush()
 
         # Reset session
         self.current_session_id = None
@@ -181,27 +186,17 @@ class ConversationMemory:
             "success_rate": success_rate
         }
 
+    # Command-ish verbs that aren't topics, on top of the shared stopwords
+    _TOPIC_STOPWORDS = frozenset({'open', 'close', 'start', 'run', 'show', 'please'})
+
     def _extract_key_topics(self) -> List[str]:
         """Extract key topics from session messages"""
-        # Common stopwords
-        stopwords = {
-            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for',
-            'of', 'with', 'by', 'from', 'as', 'is', 'was', 'are', 'were', 'be',
-            'open', 'close', 'start', 'run', 'show', 'me', 'my', 'i', 'you', 'please'
-        }
-
-        # Collect all words from user messages
         all_words = []
         for msg in self.session_messages:
-            words = msg['user'].lower().split()
-            # Filter stopwords and short words
-            filtered = [w.strip('.,!?') for w in words if len(w) > 3 and w.lower() not in stopwords]
-            all_words.extend(filtered)
+            keywords = memory_utils.extract_keywords(msg['user'])
+            all_words.extend(w for w in keywords if w not in self._TOPIC_STOPWORDS and len(w) > 3)
 
-        # Count frequency
         word_counts = Counter(all_words)
-
-        # Return most common topics
         return [word for word, count in word_counts.most_common(10)]
 
     def _create_concise_summary(self, key_topics: List[str]) -> str:
@@ -258,24 +253,30 @@ class ConversationMemory:
             ai_response: AI's response
             significance: 'high', 'medium', or 'low'
         """
-        ltm_id = f"ltm_{uuid.uuid4().hex[:8]}"
+        with self.learning_system.lock:
+            ltm_list = self.learning_system.learnings["conversation_memory"]["long_term_memory"]
 
-        memory = {
-            "id": ltm_id,
-            "type": "important_conversation",
-            "summary": f"User: {user_message[:100]}",
-            "date": datetime.now().isoformat(),
-            "significance": significance
-        }
+            memory = {
+                "id": f"ltm_{memory_utils.max_id_number(ltm_list, 'ltm') + 1:03d}",
+                "type": "important_conversation",
+                "summary": f"User: {user_message[:100]}",
+                "date": datetime.now().isoformat(),
+                "significance": significance
+            }
 
-        self.learning_system.learnings["conversation_memory"]["long_term_memory"].append(memory)
+            ltm_list.append(memory)
 
-        # Keep only last 50 long-term memories
-        ltm_list = self.learning_system.learnings["conversation_memory"]["long_term_memory"]
-        if len(ltm_list) > 50:
-            self.learning_system.learnings["conversation_memory"]["long_term_memory"] = ltm_list[-50:]
+            # Cap at 50: keep highest-significance first, most recent as tiebreak
+            # (same policy as DataManager, so the two prune paths agree)
+            if len(ltm_list) > 50:
+                rank = {"high": 3, "medium": 2, "low": 1}
+                ltm_list.sort(
+                    key=lambda m: (rank.get(m.get("significance", "low"), 1), m.get("date", "")),
+                    reverse=True
+                )
+                del ltm_list[50:]
 
-        self.learning_system._save_learnings()
+            self.learning_system.mark_dirty()
 
     def get_session_count(self) -> int:
         """Get total number of sessions"""

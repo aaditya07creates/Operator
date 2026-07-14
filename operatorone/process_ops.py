@@ -212,11 +212,13 @@ class ProcessOps:
         """
         try:
             # Use subprocess to start the process
+            # Fire-and-forget: PIPE would deadlock once the buffer fills since
+            # nothing ever drains it
             proc = subprocess.Popen(
                 command,
                 shell=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL
             )
 
             return True, f"✓ Started process (PID: {proc.pid}): {command}", ""

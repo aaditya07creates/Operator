@@ -92,7 +92,7 @@ class ClipboardOps:
         """
         try:
             from key_ops import KeyOps
-            success, output, error = KeyOps.press_combo(['ctrl', 'c'])
+            success, output, error = KeyOps.key_combo(['ctrl', 'c'])
             if success:
                 return True, "✓ Copy command triggered (Ctrl+C)", ""
             else:
@@ -113,7 +113,7 @@ class ClipboardOps:
         """
         try:
             from key_ops import KeyOps
-            success, output, error = KeyOps.press_combo(['ctrl', 'v'])
+            success, output, error = KeyOps.key_combo(['ctrl', 'v'])
             if success:
                 return True, "✓ Paste command triggered (Ctrl+V)", ""
             else:

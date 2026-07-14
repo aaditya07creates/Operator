@@ -21,7 +21,7 @@ class CoreMemory:
         })
 
     def _save(self):
-        self.learning_system._save_learnings()
+        self.learning_system.mark_dirty()
 
     # ==================== Identity ====================
 
@@ -93,15 +93,10 @@ class CoreMemory:
     # ==================== Core Prompt Assembly ====================
 
     def get_total_core_items(self) -> int:
-        """Count total items across all core sections."""
+        """Count curatable items in core memory (identity/personality are
+        fixed fields, not counted against the cap)."""
         core = self._core()
         count = 0
-        identity = core.get("identity", {})
-        for v in identity.values():
-            if v:
-                count += 1
-        personality = core.get("personality", {})
-        count += len(personality)
         count += len(core.get("preferences", {}))
         count += len(core.get("active_projects", []))
         count += len(core.get("important_facts", []))

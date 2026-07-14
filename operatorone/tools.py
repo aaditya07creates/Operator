@@ -196,7 +196,7 @@ class HelpTool:
         for tool in all_tools:
             if tool.name in ['img']:
                 action_tools.append(tool)
-            elif tool.name in ['core', 'tiers', 'curate']:
+            elif tool.name in ['core', 'tiers']:
                 memory_tools.append(tool)
             elif tool.name in ['stats', 'memory', 'profile', 'knowledge', 'sessions', 'storage', 'paths']:
                 info_tools.append(tool)
@@ -287,12 +287,20 @@ class ProfileTool:
 
     @staticmethod
     def execute(user_prompt: str = "") -> ToolResult:
-        """Show user profile and preferences"""
+        """Show what OPERATOR has stored about the user (self-managed memory)."""
         if not _operator_core:
             return ToolResult(success=False, output="", error="Operator core not initialized")
 
-        profile_summary = _operator_core.user_profiler.get_profile_summary()
-        return ToolResult(success=True, output=profile_summary, error="")
+        profile = _operator_core.memory.get_user_profile() or {}
+        lines = ["=" * 60, "USER PROFILE", "=" * 60, ""]
+        if not profile:
+            lines.append("Nothing saved yet. OPERATOR stores what it learns about")
+            lines.append("you in core memory as you talk — see /core.")
+        else:
+            for key, value in profile.items():
+                lines.append(f"{key}: {value}")
+        lines += ["", "=" * 60]
+        return ToolResult(success=True, output="\n".join(lines), error="")
 
 
 class KnowledgeTool:
@@ -538,24 +546,6 @@ class TiersTool:
         return ToolResult(success=True, output="\n".join(lines), error="")
 
 
-class CurateTool:
-    """
-    /curate tool - Force immediate AI memory curation
-    """
-
-    @staticmethod
-    def execute(user_prompt: str = "") -> ToolResult:
-        """Force immediate curation run"""
-        if not _operator_core:
-            return ToolResult(success=False, output="", error="Operator core not initialized")
-
-        summary = _operator_core.memory_curator.force_curate()
-
-        lines = ["=" * 60, "MEMORY CURATION", "=" * 60, "", summary, "", "=" * 60]
-
-        return ToolResult(success=True, output="\n".join(lines), error="")
-
-
 class PathsTool:
     """
     /paths tool - Show data file locations
@@ -682,13 +672,6 @@ ToolRegistry.register(
     icon='📊'
 )
 
-ToolRegistry.register(
-    name='curate',
-    handler=CurateTool.execute,
-    description='Force AI memory curation',
-    usage='/curate',
-    icon='✨'
-)
 
 # Data management tools
 ToolRegistry.register(
@@ -710,63 +693,42 @@ ToolRegistry.register(
 
 def process_tool_command(text: str) -> Tuple[bool, Optional[ToolResult], str]:
     """
-    Process a tool command if text contains /toolname anywhere.
+    Process a tool command if the input starts with /toolname.
 
-    Args:
-        text: User input text (can contain tool command anywhere)
+    Only inputs that *begin* with a slash are treated as tool commands, so
+    paths and URLs inside normal requests (e.g. "open C:/Users/...") are
+    left for the AI.
 
     Returns:
         (is_tool_command, tool_result, remaining_text) tuple
-        - is_tool_command: True if a tool was found
-        - tool_result: Result from tool execution
-        - remaining_text: Any text before/after the tool command
     """
     import re
 
-    # Find tool command pattern: /toolname (can be anywhere in text)
-    # Pattern: /[word] with optional arguments until the next / or end
-    tool_pattern = r'/(\w+)(?:\s+([^/]+?))?(?=\s*/|$)'
-    match = re.search(tool_pattern, text)
+    match = re.match(r'^\s*/(\w+)(?:\s+(.*))?$', text, re.DOTALL)
 
     if not match:
         return False, None, text
 
     tool_name = match.group(1)
-    tool_args = match.group(2) or ""
+    tool_args = (match.group(2) or "").strip()
 
-    # Extract text before and after the tool command
-    before_tool = text[:match.start()].strip()
-    after_tool = text[match.end():].strip()
-
-    # Combine remaining text
-    remaining_text = f"{before_tool} {after_tool}".strip()
-
-    # Get tool handler
     handler = ToolRegistry.get(tool_name)
 
     if handler is None:
-        # Unknown tool
         available = ", ".join([f"/{t}" for t in ToolRegistry.list_tools()])
         return True, ToolResult(
             success=False,
             output="",
             error=f"Unknown tool: /{tool_name}\nAvailable tools: {available}\nType /help for more info."
-        ), remaining_text
+        ), ""
 
-    # Execute tool with combined context (remaining text + tool args)
     try:
-        # If there's remaining text, use it as context for the tool
-        if remaining_text:
-            user_prompt = f"{remaining_text} {tool_args}".strip()
-        else:
-            user_prompt = tool_args.strip()
-
-        result = handler(user_prompt)
-        return True, result, remaining_text
+        result = handler(tool_args)
+        return True, result, ""
     except Exception as e:
         op_logger.logger.error(f"Tool /{tool_name} failed: {e}")
         return True, ToolResult(
             success=False,
             output="",
             error=f"Tool failed: {str(e)}"
-        ), remaining_text
+        ), ""
